@@ -1,0 +1,44 @@
+name: Утренний новостной дайджест
+
+on:
+  schedule:
+    # 06:00 UTC = 08:00 по Осло во время летнего времени (CEST, UTC+2), март–октябрь.
+    # Зимой (CET, UTC+1) это будет публиковаться в 07:00 по Осло — на час раньше.
+    # Cron не умеет учитывать переход на летнее время автоматически.
+    # Если хочешь точные 08:00 круглый год, в конце октября поменяй "0 6" на "0 7"
+    # (и обратно в конце марта), либо используй динамическую проверку времени внутри скрипта.
+    - cron: "0 6 * * *"
+  workflow_dispatch: {}  # позволяет запустить вручную из вкладки Actions на GitHub
+
+jobs:
+  publish-digest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout репозитория
+        uses: actions/checkout@v4
+
+      - name: Установка Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Установка зависимостей
+        run: pip install -r requirements.txt
+
+      - name: Запуск бота
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHANNEL_ID }}
+          GEMINI_KEY: ${{ secrets.GEMINI_KEY }}
+        run: python news_bot.py
+
+      - name: Сохранить историю публикаций
+        # История публикаций (published_history.json) обновляется ботом,
+        # коммитим её обратно в репозиторий, чтобы при следующем запуске
+        # бот не дублировал уже опубликованные новости.
+        run: |
+          git config user.name "news-bot"
+          git config user.email "news-bot@users.noreply.github.com"
+          git add published_history.json
+          git diff --staged --quiet || git commit -m "chore: update published history [skip ci]"
+          git push
