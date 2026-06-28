@@ -3,10 +3,10 @@
 
 Каждое утро:
 1. Собирает свежие новости (за последние ~24 часа) из NRK, VG, Aftenposten и Dagbladet.
-2. Выбирает топ-N (по умолчанию 5) самых свежих/важных.
-3. Переводит и адаптирует их на русский язык одним постом через Gemini.
-4. Публикует пост в Telegram-канал со ссылками на оригиналы.
-5. Запоминает, какие новости уже публиковались, чтобы не дублировать на следующий день.
+2. Выбирает топ-N (по умолчанию 5) самых свежих.
+3. Переводит каждую новость отдельно через Gemini.
+4. Публикует каждую новость отдельным постом: картинка + текст + ссылка на оригинал.
+5. Запоминает, какие новости уже публиковались, чтобы не дублировать.
 
 Запуск: python news_bot.py
 Требуемые переменные окружения: TELEGRAM_TOKEN, CHANNEL_ID, GEMINI_KEY
@@ -31,18 +31,20 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 GEMINI_KEY = os.environ.get("GEMINI_KEY")
 
-# Сколько новостей включать в один утренний пост
+# Сколько новостей публиковать каждое утро
 TOP_N_NEWS = 5
 
 # За какой период считаем новости "свежими" (часы)
 FRESHNESS_WINDOW_HOURS = 24
 
-# Файл, где храним ссылки на уже опубликованные новости (защита от дублей)
+# Файл с историей опубликованных ссылок
 HISTORY_FILE = os.path.join(os.path.dirname(__file__), "published_history.json")
-# Сколько дней хранить историю (чтобы файл не рос бесконечно)
 HISTORY_RETENTION_DAYS = 7
 
-# Источники новостей: RSS-ленты норвежских СМИ
+# Флаг-заглушка если картинка не найдена
+FALLBACK_IMAGE_URL = "https://upload.wikimedia.org/wikipedia/commons/thumb/d/d9/Flag_of_Norway.svg/1280px-Flag_of_Norway.svg.png"
+
+# Источники новостей
 RSS_SOURCES = {
     "NRK": [
         "https://www.nrk.no/toppsaker.rss",
@@ -64,6 +66,10 @@ REQUEST_HEADERS = {
     "User-Agent": "Mozilla/5.0 (compatible; NewsDigestBot/1.0; +https://t.me/)"
 }
 
+
+# ==========================================
+# БЛОК 1 — ПАМЯТЬ БОТА
+# ==========================================
 
 def load_history():
     """Загружает историю опубликованных ссылок, отбрасывая устаревшие записи."""
@@ -95,8 +101,12 @@ def save_history(history):
         print(f"⚠️ Не удалось сохранить историю публикаций: {e}")
 
 
+# ==========================================
+# БЛОК 2 — СБОР НОВОСТЕЙ ИЗ RSS
+# ==========================================
+
 def parse_pub_date(item):
-    """Пытается распарсить дату публикации из RSS-айтема. Возвращает aware datetime в UTC или None."""
+    """Парсит дату публикации из RSS-элемента."""
     for tag in ("pubDate", "{http://purl.org/dc/elements/1.1/}date", "published"):
         el = item.find(tag)
         if el is not None and el.text:
@@ -111,7 +121,7 @@ def parse_pub_date(item):
 
 
 def fetch_feed(url):
-    """Скачивает и парсит один RSS-фид. Возвращает список айтемов (raw XML elements) или []."""
+    """Скачивает и парсит один RSS-фид."""
     try:
         response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=REQUEST_HEADERS)
         if response.status_code != 200:
@@ -128,7 +138,7 @@ def fetch_feed(url):
 
 
 def collect_fresh_news(history):
-    """Собирает свежие новости из всех источников, фильтрует по времени и истории публикаций."""
+    """Собирает свежие новости из всех источников."""
     cutoff = datetime.now(timezone.utc) - timedelta(hours=FRESHNESS_WINDOW_HOURS)
     candidates = []
 
@@ -151,9 +161,6 @@ def collect_fresh_news(history):
                     continue
 
                 pub_date = parse_pub_date(item)
-                # Если дату распарсить не удалось — не отбрасываем новость,
-                # но и не можем подтвердить, что она "свежая"; помечаем как None
-                # и сортируем такие в конец списка.
                 if pub_date is not None and pub_date < cutoff:
                     continue
 
@@ -165,103 +172,184 @@ def collect_fresh_news(history):
                     "pub_date": pub_date,
                 })
 
-    # Сортируем: сначала те, у кого есть дата (самые свежие первыми),
-    # затем те, у кого даты нет.
     candidates.sort(
         key=lambda x: x["pub_date"] if x["pub_date"] is not None else datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
 
-    print(f"\n✅ Найдено {len(candidates)} свежих новостей (за последние {FRESHNESS_WINDOW_HOURS}ч), не публиковавшихся ранее.")
+    print(f"\n✅ Найдено {len(candidates)} свежих новостей, не публиковавшихся ранее.")
     return candidates[:TOP_N_NEWS]
 
 
-def build_digest_prompt(news_list):
-    """Формирует промпт для Gemini, чтобы получить один пост со всеми новостями."""
-    items_text = ""
-    for i, news in enumerate(news_list, start=1):
-        items_text += (
-            f"\n--- Новость {i} (источник: {news['source']}) ---\n"
-            f"Заголовок: {news['title']}\n"
-            f"Описание: {news['description']}\n"
-        )
+# ==========================================
+# БЛОК 3 — КАРТИНКИ (новый блок)
+# Ищем og:image на странице новости.
+# og:image — это специальный тег который сайты
+# добавляют чтобы соцсети показывали превью.
+# ==========================================
 
-    prompt = f"""Ты профессиональный переводчик и редактор новостей.
-Ниже даны {len(news_list)} норвежских новостей за сегодня. Переведи и адаптируй их на русский язык
-для украинских иммигрантов, живущих в Норвегии. Текст должен быть понятным, живым и практически полезным.
-
-Сделай ОДИН пост-дайджест по следующему шаблону (используй простые дефисы для списков,
-не используй Markdown-разметку типа ** или #, чтобы не ломать сообщение в Telegram):
-
-🇳🇴 НОВОСТИ НОРВЕГИИ — [сегодняшняя дата в формате ДД.ММ.ГГГГ]
-
-Затем для каждой новости отдельный блок строго в таком виде:
-
-[номер]. [Заголовок на русском, кратко и по делу]
-[1-2 предложения сути новости]
-Почему это важно: [короткий практический вывод для иммигранта]
-
-Если несколько новостей примерно об одном и том же — объедини их в один пункт, не повторяйся.
-Не добавляй ссылки и не упоминай источники в тексте — они будут добавлены отдельно после твоего текста.
-Не пиши никакого вступления или заключения от себя, только сам дайджест по шаблону.
-
-Вот новости:
-{items_text}
-"""
-    return prompt
-
-
-def translate_and_adapt(news_list):
-    """Отправляет пачку новостей в Gemini, получает готовый текст дайджеста."""
-    print("\n2. Отправляем новости в Gemini для перевода и адаптации...")
-    prompt = build_digest_prompt(news_list)
-
-    model = genai.GenerativeModel(model_name="models/gemini-2.5-flash")
+def fetch_og_image(url):
+    """
+    Заходит на страницу новости и ищет тег og:image.
+    Если находит — возвращает URL картинки.
+    Если нет — возвращает None, и тогда используем флаг-заглушку.
+    """
     try:
-        response = model.generate_content(prompt)
-        return response.text
-    except Exception as e:
-        print(f"❌ Ошибка при обращении к Gemini API: {e}")
+        response = requests.get(url, timeout=REQUEST_TIMEOUT, headers=REQUEST_HEADERS)
+        if response.status_code != 200:
+            return None
+
+        # Ищем строку вида: <meta property="og:image" content="https://...">
+        # Делаем это простым поиском по тексту, без тяжёлых библиотек
+        html = response.text
+        marker = 'property="og:image"'
+        pos = html.find(marker)
+        if pos == -1:
+            # Некоторые сайты пишут по-другому
+            marker = "property='og:image'"
+            pos = html.find(marker)
+        if pos == -1:
+            return None
+
+        # После маркера ищем content="..."
+        content_pos = html.find('content="', pos)
+        if content_pos == -1:
+            content_pos = html.find("content='", pos)
+        if content_pos == -1:
+            return None
+
+        # Определяем какая кавычка используется
+        quote_char = html[content_pos + 8]
+        start = content_pos + 9
+        end = html.find(quote_char, start)
+        if end == -1:
+            return None
+
+        image_url = html[start:end].strip()
+        if image_url.startswith("http"):
+            return image_url
+        return None
+
+    except requests.RequestException:
         return None
 
 
-def append_sources(digest_text, news_list):
-    """Добавляет в конец поста список ссылок на оригиналы."""
-    sources_block = "\n\n📎 Источники:\n"
-    for i, news in enumerate(news_list, start=1):
-        sources_block += f"{i}. {news['source']}: {news['link']}\n"
-    return digest_text.strip() + sources_block
+# ==========================================
+# БЛОК 4 — ПЕРЕВОД ЧЕРЕЗ GEMINI
+# Теперь переводим каждую новость отдельно,
+# а не все вместе — чтобы каждый пост был
+# самостоятельным и красивым.
+# ==========================================
+
+def translate_single_news(news, model):
+    """
+    Переводит одну новость через Gemini.
+    Возвращает готовый текст для Telegram-поста.
+    """
+    today = datetime.now().strftime("%d.%m.%Y")
+
+    prompt = f"""Ты профессиональный редактор новостей.
+Переведи и адаптируй эту норвежскую новость на русский язык для украинцев, живущих в Норвегии.
+
+Заголовок: {news['title']}
+Описание: {news['description']}
+Источник: {news['source']}
+Дата: {today}
+
+Напиши пост строго по этому шаблону (без Markdown-разметки типа ** или #):
+
+🇳🇴 [Заголовок на русском, кратко и по делу]
+
+[2-3 предложения сути новости, живым языком]
+
+Почему это важно: [1 предложение — практический вывод для иммигранта]
+
+📰 {news['source']} • {today}
+
+Не добавляй ссылки в текст — они будут добавлены отдельно.
+Не пиши ничего от себя, только сам пост по шаблону."""
+
+    try:
+        response = model.generate_content(prompt)
+        return response.text.strip()
+    except Exception as e:
+        print(f"❌ Ошибка Gemini для новости '{news['title']}': {e}")
+        # Если Gemini недоступен — публикуем оригинальный заголовок
+        return f"🇳🇴 {news['title']}\n\n{news['description']}\n\n📰 {news['source']} • {today}"
 
 
-def send_to_telegram(text):
-    """Публикация сообщения в Telegram-канал. Разбивает на части, если текст слишком длинный."""
-    print("\n3. Публикуем в Telegram...")
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+# ==========================================
+# БЛОК 5 — ОТПРАВКА В TELEGRAM
+# Теперь каждая новость = отдельный пост
+# с картинкой (sendPhoto) или без (sendMessage)
+# ==========================================
 
-    # Telegram ограничивает сообщение 4096 символами
-    MAX_LEN = 4096
-    chunks = [text[i:i + MAX_LEN] for i in range(0, len(text), MAX_LEN)] or [text]
+def send_news_post(news, text):
+    """
+    Отправляет одну новость в канал.
+    Сначала пробует отправить с картинкой (sendPhoto).
+    Если картинка не найдена или не загрузилась — использует флаг 🇳🇴.
+    Ссылка на оригинал добавляется как кнопка под постом.
+    """
+    # Кнопка-ссылка под постом (inline keyboard)
+    reply_markup = {
+        "inline_keyboard": [[
+            {"text": f"📖 Читать на {news['source']}", "url": news['link']}
+        ]]
+    }
 
-    for chunk in chunks:
-        payload = {"chat_id": CHANNEL_ID, "text": chunk}
-        try:
-            response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-            data = response.json()
-        except requests.RequestException as e:
-            print(f"❌ Сетевая ошибка при отправке в Telegram: {e}")
+    # Ищем картинку на странице новости
+    print(f"   Ищем картинку для: {news['title'][:50]}...")
+    image_url = fetch_og_image(news['link'])
+
+    if image_url:
+        print(f"   ✅ Картинка найдена")
+    else:
+        print(f"   🇳🇴 Картинка не найдена — используем флаг")
+        image_url = FALLBACK_IMAGE_URL
+
+    # Пробуем отправить с картинкой
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
+    payload = {
+        "chat_id": CHANNEL_ID,
+        "photo": image_url,
+        "caption": text,
+        "reply_markup": reply_markup,
+    }
+
+    try:
+        response = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
+        data = response.json()
+
+        if data.get("ok"):
+            print(f"   ✅ Пост опубликован!")
+            return True
+
+        # Если картинка не загрузилась — отправляем просто текст
+        print(f"   ⚠️ Не удалось отправить фото: {data.get('description')} — отправляем текстом")
+        url_text = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload_text = {
+            "chat_id": CHANNEL_ID,
+            "text": text,
+            "reply_markup": reply_markup,
+        }
+        response2 = requests.post(url_text, json=payload_text, timeout=REQUEST_TIMEOUT)
+        data2 = response2.json()
+        if data2.get("ok"):
+            print(f"   ✅ Пост опубликован (текстом)!")
+            return True
+        else:
+            print(f"   ❌ Ошибка отправки: {data2}")
             return False
-        except ValueError:
-            print(f"❌ Telegram вернул не-JSON ответ: {response.text}")
-            return False
 
-        if not data.get("ok"):
-            print(f"❌ Ошибка отправки в Telegram: {data}")
-            return False
-        time.sleep(0.5)  # небольшая пауза между частями, если их несколько
+    except requests.RequestException as e:
+        print(f"   ❌ Сетевая ошибка: {e}")
+        return False
 
-    print("🎉 Успех! Дайджест опубликован в канале!")
-    return True
 
+# ==========================================
+# БЛОК 6 — ПРОВЕРКА НАСТРОЕК
+# ==========================================
 
 def validate_config():
     missing = [name for name, val in [
@@ -271,41 +359,60 @@ def validate_config():
     ] if not val]
     if missing:
         print(f"❌ Не заданы переменные окружения: {', '.join(missing)}")
-        print("   Установи их перед запуском, например через export или GitHub Secrets.")
         sys.exit(1)
 
+
+# ==========================================
+# БЛОК 7 — ГЛАВНАЯ ФУНКЦИЯ
+# Дирижёр: вызывает все блоки по порядку
+# ==========================================
 
 def main():
     print("🔄 Запуск новостного бота...")
     validate_config()
     genai.configure(api_key=GEMINI_KEY)
+    model = genai.GenerativeModel(model_name="models/gemini-2.5-flash")
 
+    # Шаг 1: загружаем память о прошлых публикациях
     history = load_history()
 
+    # Шаг 2: собираем свежие новости
     news_list = collect_fresh_news(history)
     if not news_list:
-        print("❌ Свежих неопубликованных новостей не найдено. Завершение работы.")
+        print("❌ Свежих неопубликованных новостей не найдено.")
         return
 
-    print(f"\nВыбраны для дайджеста ({len(news_list)}):")
+    print(f"\nВыбраны для публикации ({len(news_list)}):")
     for n in news_list:
         print(f"   [{n['source']}] {n['title']}")
 
-    digest = translate_and_adapt(news_list)
-    if not digest:
-        print("❌ Не удалось получить ответ от Gemini. Завершение работы без публикации.")
-        return
+    # Шаг 3: публикуем каждую новость отдельным постом
+    print(f"\n📤 Публикуем {len(news_list)} постов...")
+    published_count = 0
 
-    final_text = append_sources(digest, news_list)
+    for i, news in enumerate(news_list, start=1):
+        print(f"\n--- Новость {i}/{len(news_list)} ---")
 
-    if send_to_telegram(final_text):
-        # Отмечаем новости как опубликованные только при успешной отправке
-        now_iso = datetime.now(timezone.utc).isoformat()
-        for n in news_list:
-            history[n["link"]] = now_iso
-        save_history(history)
-    else:
-        print("⚠️ Публикация не удалась — история не обновлена, новости останутся кандидатами на следующий запуск.")
+        # Переводим через Gemini
+        text = translate_single_news(news, model)
+
+        # Отправляем в Telegram
+        success = send_news_post(news, text)
+
+        if success:
+            # Запоминаем что опубликовали
+            history[news['link']] = datetime.now(timezone.utc).isoformat()
+            published_count += 1
+
+        # Пауза между постами чтобы не спамить
+        if i < len(news_list):
+            print("   ⏳ Пауза 3 секунды...")
+            time.sleep(3)
+
+    # Шаг 4: сохраняем обновлённую историю
+    save_history(history)
+
+    print(f"\n🎉 Готово! Опубликовано {published_count} из {len(news_list)} новостей.")
 
 
 if __name__ == "__main__":
